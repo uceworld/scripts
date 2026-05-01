@@ -1,0 +1,5 @@
+Priority,SourceOuPattern,TargetOuOverride,MirrorAllowed,AutoCreateAllowed,FallbackTargetOu,Enabled
+1,"OU=New York,OU=Servers,DC=ad,DC=mdp,DC=com","OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",False,False,"OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",True
+2,"OU=Windows,OU=AWS,OU=Servers Cloud,DC=ad,DC=mdp,DC=com","OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",False,False,"OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",True
+3,"OU=2019,OU=Des Moines,OU=Servers,DC=ad,DC=mdp,DC=com","OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",False,False,"OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",True
+999,"*","OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",False,False,"OU=ADMDP,OU=Migrated,OU=Computers,OU=ID,DC=id,DC=people,DC=inc",True
