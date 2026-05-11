@@ -43,42 +43,75 @@ $remoteScan = {
     param([datetime]$CutoffTime)
 
     $computerName = $env:COMPUTERNAME
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $secureChannel = try { Test-ComputerSecureChannel -ErrorAction Stop } catch { "FAILED: $($_.Exception.Message)" }
 
-    $userProfileRows = @()
-    $profiles = @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -like "C:\Users\*" })
-    foreach ($profile in $profiles) {
-        $folderItem = Get-Item -LiteralPath $profile.LocalPath -Force -ErrorAction SilentlyContinue
-        $leaf = Split-Path $profile.LocalPath -Leaf
-        $isSystemSid = $profile.SID -in @("S-1-5-18","S-1-5-19","S-1-5-20")
-        $isDefaultProfile = $leaf -in @("Default","Default User","Public","All Users","desktop.ini")
-        $isMigrationAdminProfile = $leaf -like "*CM-MigrationAdmin*"
-        $postCutoffFolder = $false
-        if ($folderItem) {
-            $postCutoffFolder = ($folderItem.CreationTime -ge $CutoffTime -or $folderItem.LastWriteTime -ge $CutoffTime)
+    $domain = ""
+    $partOfDomain = ""
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $domain = $cs.Domain
+        $partOfDomain = $cs.PartOfDomain
+    }
+    catch {
+        $domain = "FAILED: $($_.Exception.Message)"
+        $partOfDomain = ""
+    }
+
+    $secureChannel = ""
+    try {
+        $secureChannel = Test-ComputerSecureChannel -ErrorAction Stop
+    }
+    catch {
+        $secureChannel = "FAILED: $($_.Exception.Message)"
+    }
+
+    $profileRows = @()
+    $profileObjects = @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -like "C:\Users\*" })
+
+    foreach ($profile in $profileObjects) {
+        $localPath = [string]$profile.LocalPath
+        $folderName = Split-Path $localPath -Leaf
+        $folderItem = Get-Item -LiteralPath $localPath -Force -ErrorAction SilentlyContinue
+
+        $folderCreationTime = ""
+        $folderLastWriteTime = ""
+        $createdOrChangedAfterCutoff = $false
+
+        if ($null -ne $folderItem) {
+            $folderCreationTime = $folderItem.CreationTime
+            $folderLastWriteTime = $folderItem.LastWriteTime
+            if ($folderItem.CreationTime -ge $CutoffTime -or $folderItem.LastWriteTime -ge $CutoffTime) {
+                $createdOrChangedAfterCutoff = $true
+            }
         }
 
-        $userProfileRows += [pscustomobject]@{
+        $sid = [string]$profile.SID
+        $isSystemSid = $sid -in @("S-1-5-18","S-1-5-19","S-1-5-20")
+        $isDefaultProfile = $folderName -in @("Default","Default User","Public","All Users","desktop.ini")
+        $isMigrationAdminProfile = $folderName -like "*CM-MigrationAdmin*"
+
+        $suspicious = $false
+        if (-not $isSystemSid -and -not $isDefaultProfile -and -not $isMigrationAdminProfile -and $createdOrChangedAfterCutoff) {
+            $suspicious = $true
+        }
+
+        $profileRows += [pscustomobject]@{
             ComputerName = $computerName
-            Domain = $cs.Domain
-            PartOfDomain = $cs.PartOfDomain
+            Domain = $domain
+            PartOfDomain = $partOfDomain
             SecureChannel = $secureChannel
-            SID = $profile.SID
-            LocalPath = $profile.LocalPath
-            FolderName = $leaf
+            SID = $sid
+            LocalPath = $localPath
+            FolderName = $folderName
             Loaded = $profile.Loaded
             Special = $profile.Special
-            RoamingConfigured = $profile.RoamingConfigured
-            LastUseTime = if ($profile.LastUseTime) { $profile.LastUseTime } else { "" }
-            FolderCreationTime = if ($folderItem) { $folderItem.CreationTime } else { "" }
-            FolderLastWriteTime = if ($folderItem) { $folderItem.LastWriteTime } else { "" }
-            FolderLengthMB = try { [math]::Round(((Get-ChildItem -LiteralPath $profile.LocalPath -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB),2) } catch { "" }
+            LastUseTime = $profile.LastUseTime
+            FolderCreationTime = $folderCreationTime
+            FolderLastWriteTime = $folderLastWriteTime
             IsSystemSid = $isSystemSid
             IsDefaultProfile = $isDefaultProfile
             IsMigrationAdminProfile = $isMigrationAdminProfile
-            CreatedOrChangedAfterCutoff = $postCutoffFolder
-            SuspiciousPostJoinProfile = (-not $isSystemSid -and -not $isDefaultProfile -and -not $isMigrationAdminProfile -and $postCutoffFolder)
+            CreatedOrChangedAfterCutoff = $createdOrChangedAfterCutoff
+            SuspiciousPostJoinProfile = $suspicious
         }
     }
 
@@ -88,8 +121,11 @@ $remoteScan = {
         foreach ($event in $events) {
             $xml = [xml]$event.ToXml()
             $data = @{}
-            foreach ($d in $xml.Event.EventData.Data) { $data[$d.Name] = $d.'#text' }
-            $logonType = $data["LogonType"]
+            foreach ($entry in $xml.Event.EventData.Data) {
+                $data[$entry.Name] = $entry.'#text'
+            }
+
+            $logonType = [string]$data["LogonType"]
             if ($logonType -in @("2","7","10","11")) {
                 $logonRows += [pscustomobject]@{
                     ComputerName = $computerName
@@ -140,19 +176,19 @@ $remoteScan = {
         }
     }
 
-    $summary = [pscustomobject]@{
+    $summaryRow = [pscustomobject]@{
         ComputerName = $computerName
-        Domain = $cs.Domain
-        PartOfDomain = $cs.PartOfDomain
+        Domain = $domain
+        PartOfDomain = $partOfDomain
         SecureChannel = $secureChannel
-        ProfileCount = $userProfileRows.Count
-        SuspiciousPostJoinProfileCount = @($userProfileRows | Where-Object { $_.SuspiciousPostJoinProfile -eq $true }).Count
+        ProfileCount = @($profileRows).Count
+        SuspiciousPostJoinProfileCount = @($profileRows | Where-Object { $_.SuspiciousPostJoinProfile -eq $true }).Count
         RecentInteractiveLogonCount = @($logonRows).Count
     }
 
     [pscustomobject]@{
-        Summary = $summary
-        Profiles = $userProfileRows
+        Summary = $summaryRow
+        Profiles = $profileRows
         Logons = $logonRows
         Admins = $adminRows
     }
@@ -196,18 +232,17 @@ foreach ($target in $targets) {
         }
     }
 
-    foreach ($row in @($result.Summary)) {
-        $allSummary += [pscustomobject]@{
-            ComputerName = $row.ComputerName
-            Domain = $row.Domain
-            PartOfDomain = $row.PartOfDomain
-            SecureChannel = $row.SecureChannel
-            ProfileCount = $row.ProfileCount
-            SuspiciousPostJoinProfileCount = $row.SuspiciousPostJoinProfileCount
-            RecentInteractiveLogonCount = $row.RecentInteractiveLogonCount
-            AccessUsed = $accessUsed
-            Error = ""
-        }
+    $summaryItem = $result.Summary
+    $allSummary += [pscustomobject]@{
+        ComputerName = $summaryItem.ComputerName
+        Domain = $summaryItem.Domain
+        PartOfDomain = $summaryItem.PartOfDomain
+        SecureChannel = $summaryItem.SecureChannel
+        ProfileCount = $summaryItem.ProfileCount
+        SuspiciousPostJoinProfileCount = $summaryItem.SuspiciousPostJoinProfileCount
+        RecentInteractiveLogonCount = $summaryItem.RecentInteractiveLogonCount
+        AccessUsed = $accessUsed
+        Error = ""
     }
 
     $allProfiles += @($result.Profiles)
@@ -228,6 +263,8 @@ Write-Host "Summary written to: $summaryOut" -ForegroundColor Green
 Write-Host ""
 
 $allSummary | Format-Table -AutoSize
+
 Write-Host ""
-$allProfiles | Where-Object { $_.SuspiciousPostJoinProfile -eq $true } | Select-Object ComputerName,FolderName,SID,LocalPath,Loaded,LastUseTime,FolderCreationTime,FolderLastWriteTime,FolderLengthMB | Format-Table -AutoSize
-'@ | Set-Content -Path $scriptPath -Encoding UTF8; Write-Host "Created $scriptPath"
+Write-Host "Suspicious post-join profiles:"
+$allProfiles | Where-Object { $_.SuspiciousPostJoinProfile -eq $true } | Select-Object ComputerName,FolderName,SID,LocalPath,Loaded,LastUseTime,FolderCreationTime,FolderLastWriteTime | Format-Table -AutoSize
+'@ | Set-Content -Path $scriptPath -Encoding UTF8; Write-Host "Replaced $scriptPath"
