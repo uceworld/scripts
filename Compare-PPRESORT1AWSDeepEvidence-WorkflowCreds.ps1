@@ -2,10 +2,14 @@
 param(
     [string]$MigratedIp = "10.254.140.161",
     [string]$SnapshotIp = "10.254.140.4",
+    [string]$ConfigPath = "C:\AD-MigrationSuite\Computer-Migration\Config\MigrationAutomationConfig.json",
+    [string]$TargetCredentialPath = "",
+    [string]$SourceCredentialPath = "",
     [string]$OutputRoot = "C:\AD-MigrationSuite\Evidence\PPRESORT1AWS-DeepCompare",
     [int]$MaxHashMB = 25,
     [switch]$IncludeAllUserProfileMetadata,
-    [switch]$KeepRemoteTemp
+    [switch]$KeepRemoteTemp,
+    [switch]$PromptForCredentials
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +44,74 @@ function Assert-WsManReady {
     catch {
         throw "WinRM is not reachable on $ComputerIp. Confirm firewall, TrustedHosts, AWS security group, and TCP 5985 from the Jumpbox. Error: $($_.Exception.Message)"
     }
+}
+
+function Resolve-WorkflowCredentialPaths {
+    param(
+        [Parameter(Mandatory)][string]$ResolvedConfigPath,
+        [string]$ExplicitTargetCredentialPath,
+        [string]$ExplicitSourceCredentialPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ResolvedConfigPath)) {
+        throw "Config file not found: $ResolvedConfigPath"
+    }
+
+    $config = Get-Content -Path $ResolvedConfigPath -Raw | ConvertFrom-Json
+    if (-not $config.CredentialFiles) {
+        throw "CredentialFiles node is missing from config: $ResolvedConfigPath"
+    }
+
+    $targetPath = $ExplicitTargetCredentialPath
+    if ([string]::IsNullOrWhiteSpace($targetPath)) {
+        if ($config.CredentialFiles.TargetDirectoryAdmin) { $targetPath = [string]$config.CredentialFiles.TargetDirectoryAdmin }
+        elseif ($config.CredentialFiles.TargetJoin) { $targetPath = [string]$config.CredentialFiles.TargetJoin }
+    }
+
+    $sourcePath = $ExplicitSourceCredentialPath
+    if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+        if ($config.CredentialFiles.SourceUnjoin) { $sourcePath = [string]$config.CredentialFiles.SourceUnjoin }
+        elseif ($config.CredentialFiles.SourceDirectoryRead) { $sourcePath = [string]$config.CredentialFiles.SourceDirectoryRead }
+        elseif ($config.CredentialFiles.SourceJoin) { $sourcePath = [string]$config.CredentialFiles.SourceJoin }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($targetPath)) {
+        throw "Unable to resolve target credential path. Expected CredentialFiles.TargetDirectoryAdmin or CredentialFiles.TargetJoin in $ResolvedConfigPath, or pass -TargetCredentialPath."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+        throw "Unable to resolve source credential path. Expected CredentialFiles.SourceUnjoin, CredentialFiles.SourceDirectoryRead, or CredentialFiles.SourceJoin in $ResolvedConfigPath, or pass -SourceCredentialPath."
+    }
+
+    return [pscustomobject]@{
+        TargetCredentialPath = $targetPath
+        SourceCredentialPath = $sourcePath
+    }
+}
+
+function Import-WorkflowCredential {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Description
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "$Description credential file not found: $Path"
+    }
+
+    try {
+        $credential = Import-Clixml -Path $Path
+    }
+    catch {
+        throw "Failed to import $Description credential from $Path. The CLIXML must be decrypted by the same user/machine context that can use the workflow credentials. Error: $($_.Exception.Message)"
+    }
+
+    if ($null -eq $credential -or $credential.GetType().FullName -ne "System.Management.Automation.PSCredential") {
+        throw "$Description credential file did not return a PSCredential object: $Path"
+    }
+
+    Write-StatusLine -Level SUCCESS -Message "Imported $Description credential from $Path"
+    return $credential
 }
 
 function Invoke-EndpointScan {
@@ -539,11 +611,17 @@ try {
     Assert-WsManReady -ComputerIp $MigratedIp
     Assert-WsManReady -ComputerIp $SnapshotIp
 
-    Write-StatusLine -Message "Enter Target AD admin credential for migrated target computer $MigratedIp in id.people.inc"
-    $targetCredential = Get-Credential -Message "Target AD admin credential for migrated PPRESORT1AWS $MigratedIp in id.people.inc"
-
-    Write-StatusLine -Message "Enter Source AD admin credential for snapshot source computer $SnapshotIp in ad.mdp.com"
-    $sourceCredential = Get-Credential -Message "Source AD admin credential for snapshot PPRESORT1AWS $SnapshotIp in ad.mdp.com"
+    if ($PromptForCredentials.IsPresent) {
+        Write-StatusLine -Level WARN -Message "PromptForCredentials was specified; using interactive credentials instead of workflow CLIXML files."
+        $targetCredential = Get-Credential -Message "Target AD admin credential for migrated PPRESORT1AWS $MigratedIp in id.people.inc"
+        $sourceCredential = Get-Credential -Message "Source AD admin credential for snapshot PPRESORT1AWS $SnapshotIp in ad.mdp.com"
+    }
+    else {
+        Write-StatusLine -Message "Resolving workflow credentials from config: $ConfigPath"
+        $credentialPaths = Resolve-WorkflowCredentialPaths -ResolvedConfigPath $ConfigPath -ExplicitTargetCredentialPath $TargetCredentialPath -ExplicitSourceCredentialPath $SourceCredentialPath
+        $targetCredential = Import-WorkflowCredential -Path $credentialPaths.TargetCredentialPath -Description "target AD admin"
+        $sourceCredential = Import-WorkflowCredential -Path $credentialPaths.SourceCredentialPath -Description "source AD admin"
+    }
 
     $migrated = Invoke-EndpointScan -Label "Migrated_Target_10.254.140.161" -ComputerIp $MigratedIp -Credential $targetCredential -RunId $runId -EvidenceRoot $evidenceRoot -MaxHashMB $MaxHashMB -IncludeAllUserProfileMetadata ([bool]$IncludeAllUserProfileMetadata.IsPresent) -KeepRemoteTemp ([bool]$KeepRemoteTemp.IsPresent)
     $snapshot = Invoke-EndpointScan -Label "Snapshot_Source_10.254.140.4" -ComputerIp $SnapshotIp -Credential $sourceCredential -RunId $runId -EvidenceRoot $evidenceRoot -MaxHashMB $MaxHashMB -IncludeAllUserProfileMetadata ([bool]$IncludeAllUserProfileMetadata.IsPresent) -KeepRemoteTemp ([bool]$KeepRemoteTemp.IsPresent)
