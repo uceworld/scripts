@@ -1,322 +1,168 @@
-$scriptPath = "C:\AD-MigrationSuite\Backups\Test-CM-PostGpoReadiness.ps1"; New-Item -Path "C:\AD-MigrationSuite\Backups" -ItemType Directory -Force | Out-Null; @'
-[CmdletBinding()]
-param(
-    [string]$OutputPath = "C:\AD-MigrationSuite\Backups\CM-PostGpoReadiness-$((Get-Date).ToString('yyyyMMdd-HHmmss')).csv",
-    [switch]$PromptForCredential
-)
+$scriptPath = "C:\AD-MigrationSuite\Tools\Compare-PPRESORT1AWSDeepEvidence-WorkflowCreds.ps1"
+$text = Get-Content -Path $scriptPath -Raw
+$text = $text -replace "`r`n","`n"
 
-$ErrorActionPreference = "Stop"
-
-$computers = @(
-"TNYCTMP2","PADMIG1AWS","PADDC93AWS","POKTA2AWS","PFILEMIG2NYC","PSQLFS1AWS","PWSUS1AWS","PWSUS2AWS","PKMS1AWS","PPS1AWS","PDIRSYNC1AWS","PSQL1AWS","pswin1dsm","PNYCIPTV1","Z8-MXL0261WYS","pvidflashnt2nyc","PFILEMIG1NYC","pstmfmpro2","PSCHEDULER2AWS","Z8-MXL9204P7Z","Z8-MXL0261WYT","PAUE1REVENUEEXC","padmgmt3aws","padmgmt2aws","padmgmt4aws","padmgmt1aws","padmgmt8aws","padmgmt5aws","pvidflashnt1nyc","PNOETIX1AWS","pdsmpsjump1","PCTW1AWS","DNOETIX1AWS","POKTA1AWS","pvidnettest1aws","Z8-MXL0253ZRV","VM-GLOU-TEMP","5420-7P878C3","5420-DGXN9C3","5420-2PT78C3","5570-FCVRFK3","7430-BK1TKN3","5400-FQKMK13","5570-F706GK3","7430-BZPRKN3","padcsweb2dsm","PIPCAM1DSM","psmsv1nyc","PSTSCN1DSM","ppascd3dsm","wdatest1aws","dsmon1dsm","pbcvm1dsm","p19sql1nyc","p19sql2nyc","5300-6FY6F63","DMATRIX1NYC","DPRESORT6AWS","TPRESORT1AWS","d19sql1nyc","t19sql1nyc","pmvmg1dsm","PSCMS2DSM","pmatrix1nyc","plansw1dsm","PPRESORT1AWS","P16SQL6DSM","padcsweb1dsm","PPRESORTLDS1AWS","E7470-5NH6J72","7490-DT260X2","5040-B2MLJH2","Z8-MXL1143CSL","Z8-MXL11547XS","5420-DPDX7C3","5420-DHRX7C3","pcert1dsm","padcsi1dsm","tjira3aws"
-)
-
-$managementIps = @("10.34.67.138","10.254.131.30","10.254.131.40","10.38.0.36","10.34.67.137")
-$admtServerIps = @("10.34.67.132")
-$localUserName = "CM-MigrationAdmin"
-$targetAdminPrincipal = "ID\Admin"
-$policyLabel = "TARGET-LANDING-DELAYED"
-
-$credential = $null
-if ($PromptForCredential.IsPresent) {
-    $credential = Get-Credential -Message "Enter a domain/admin credential that can query the 79 source computers remotely"
-}
-
-$remoteCheck = {
+function Set-ExactPatch {
     param(
-        [string]$LocalUserName,
-        [string]$TargetAdminPrincipal,
-        [string]$PolicyLabel,
-        [string[]]$ManagementIps,
-        [string[]]$AdmtServerIps
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$OldText,
+        [Parameter(Mandatory)][string]$NewText,
+        [Parameter(Mandatory)][string]$PatchName
     )
 
-    $adminMembers = @()
-    try {
-        $adminMembers = @(Get-LocalGroupMember -Group "Administrators" -ErrorAction Stop)
-    }
-    catch {
-        $adminMembers = @()
+    if (-not $Text.Contains($OldText)) {
+        throw "Patch anchor not found: $PatchName"
     }
 
-    $localUser = Get-LocalUser -Name $LocalUserName -ErrorAction SilentlyContinue
-
-    $serviceNames = @("WinRM","LanmanServer","LanmanWorkstation","Netlogon")
-    $serviceMap = @{}
-    foreach ($serviceName in $serviceNames) {
-        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        if ($null -ne $service) {
-            $serviceMap[$serviceName] = "$($service.Status)/$($service.StartType)"
-        }
-        else {
-            $serviceMap[$serviceName] = "Missing"
-        }
-    }
-
-    $winRmListeners = @(Get-ChildItem -Path WSMan:\localhost\Listener -ErrorAction SilentlyContinue)
-    $hasWinRmHttp5985 = $false
-    foreach ($listener in $winRmListeners) {
-        $transport = ""
-        $port = ""
-        try { $transport = [string](Get-Item -Path (Join-Path $listener.PSPath "Transport") -ErrorAction SilentlyContinue).Value } catch {}
-        try { $port = [string](Get-Item -Path (Join-Path $listener.PSPath "Port") -ErrorAction SilentlyContinue).Value } catch {}
-        if ($transport -eq "HTTP" -and $port -eq "5985") {
-            $hasWinRmHttp5985 = $true
-        }
-    }
-
-    $firewallRuleNames = @("CM-Allow-WinRM-5985-From-ManagementHosts","CM-Allow-ADMT-RPC-135-From-ADMT","CM-Allow-ADMT-SMB-445-From-ADMT")
-    $firewallResults = @{}
-    foreach ($ruleName in $firewallRuleNames) {
-        $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-        if ($null -eq $rule) {
-            $firewallResults[$ruleName] = "Missing"
-        }
-        else {
-            $addressFilter = $rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
-            $firewallResults[$ruleName] = "Present Enabled=$($rule.Enabled) Profile=$($rule.Profile) Remote=$($addressFilter.RemoteAddress -join ';')"
-        }
-    }
-
-    $latfp = ""
-    try { $latfp = [string](Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "LocalAccountTokenFilterPolicy" -ErrorAction Stop) } catch { $latfp = "Missing" }
-
-    $autoShareWks = ""
-    try { $autoShareWks = [string](Get-ItemPropertyValue -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters" -Name "AutoShareWks" -ErrorAction Stop) } catch { $autoShareWks = "Missing" }
-
-    $adminShareExists = $false
-    try { $adminShareExists = Test-Path "\\localhost\Admin$" } catch { $adminShareExists = $false }
-
-    $latestLog = $null
-    try {
-        $latestLog = Get-ChildItem -Path "C:\ProgramData\ComputerMigration\StartupLogs" -Filter "$PolicyLabel-*.log" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-    }
-    catch {
-        $latestLog = $null
-    }
-
-    $scheduledTasks = @()
-    try {
-        $scheduledTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like "*ComputerMigration*" -or $_.TaskName -like "*Migration*" -or $_.TaskPath -like "*ComputerMigration*" })
-    }
-    catch {
-        $scheduledTasks = @()
-    }
-
-    $localAdminMember = $false
-    foreach ($member in $adminMembers) {
-        if ($member.Name -ieq $LocalUserName -or $member.Name -like "*\$LocalUserName") {
-            $localAdminMember = $true
-        }
-    }
-
-    $targetAdminMember = $false
-    foreach ($member in $adminMembers) {
-        if ($member.Name -ieq $TargetAdminPrincipal) {
-            $targetAdminMember = $true
-        }
-    }
-
-    [pscustomobject]@{
-        ComputerName = $env:COMPUTERNAME
-        RemoteQuery = "Success"
-        LocalUserExists = [bool]($null -ne $localUser)
-        LocalUserEnabled = if ($null -ne $localUser) { [bool]$localUser.Enabled } else { $false }
-        LocalUserPasswordNeverExpires = if ($null -ne $localUser) { [bool]$localUser.PasswordNeverExpires } else { $false }
-        LocalUserMayChangePassword = if ($null -ne $localUser) { [bool]$localUser.UserMayChangePassword } else { $false }
-        LocalUserIsAdministrator = $localAdminMember
-        TargetAdminIsAdministrator = $targetAdminMember
-        WinRM = $serviceMap["WinRM"]
-        LanmanServer = $serviceMap["LanmanServer"]
-        LanmanWorkstation = $serviceMap["LanmanWorkstation"]
-        Netlogon = $serviceMap["Netlogon"]
-        WinRmHttp5985Listener = $hasWinRmHttp5985
-        LocalAccountTokenFilterPolicy = $latfp
-        AutoShareWks = $autoShareWks
-        AdminShareExists = $adminShareExists
-        FirewallWinRM5985 = $firewallResults["CM-Allow-WinRM-5985-From-ManagementHosts"]
-        FirewallAdmtRpc135 = $firewallResults["CM-Allow-ADMT-RPC-135-From-ADMT"]
-        FirewallAdmtSmb445 = $firewallResults["CM-Allow-ADMT-SMB-445-From-ADMT"]
-        BootstrapLogFound = [bool]($null -ne $latestLog)
-        BootstrapLogPath = if ($null -ne $latestLog) { $latestLog.FullName } else { "" }
-        BootstrapLogLastWriteTime = if ($null -ne $latestLog) { $latestLog.LastWriteTime } else { "" }
-        MatchingScheduledTasks = ($scheduledTasks.TaskName -join ";")
-    }
+    return $Text.Replace($OldText,$NewText)
 }
 
-$results = foreach ($computer in $computers) {
-    Write-Host "Checking $computer ..." -ForegroundColor Cyan
+$text = Set-ExactPatch -Text $text -PatchName "Add remote progress helper" -OldText @'
+            New-Item -Path $remoteRoot -ItemType Directory -Force | Out-Null
 
-    $dnsResolved = $false
-    $resolvedIp = ""
+            $scanErrors = New-Object System.Collections.Generic.List[object]
+'@ -NewText @'
+            New-Item -Path $remoteRoot -ItemType Directory -Force | Out-Null
+
+            function Write-RemoteScanStatus {
+                param([Parameter(Mandatory)][string]$Message)
+                $remoteTimestamp = Get-Date -Format s
+                Write-Host ("{0} [REMOTE:{1}] {2}" -f $remoteTimestamp, $EndpointLabel, $Message) -ForegroundColor Cyan
+            }
+
+            Write-RemoteScanStatus -Message "Remote evidence folder prepared: $remoteRoot"
+
+            $scanErrors = New-Object System.Collections.Generic.List[object]
+'@
+
+$text = Set-ExactPatch -Text $text -PatchName "Add local remote scan status before Invoke-Command" -OldText @'
     try {
-        $dnsRecord = Resolve-DnsName -Name "$computer.ad.mdp.com" -ErrorAction Stop | Where-Object { $_.Type -eq "A" } | Select-Object -First 1
-        if ($null -ne $dnsRecord) {
-            $dnsResolved = $true
-            $resolvedIp = [string]$dnsRecord.IPAddress
-        }
-    }
-    catch {
-        $dnsResolved = $false
-    }
-
-    $icmpOk = $false
-    try { $icmpOk = Test-Connection -ComputerName $computer -Count 1 -Quiet -ErrorAction SilentlyContinue } catch { $icmpOk = $false }
-
-    $port5985 = $false
-    try { $port5985 = Test-NetConnection -ComputerName $computer -Port 5985 -InformationLevel Quiet -WarningAction SilentlyContinue } catch { $port5985 = $false }
-
-    $port445 = $false
-    try { $port445 = Test-NetConnection -ComputerName $computer -Port 445 -InformationLevel Quiet -WarningAction SilentlyContinue } catch { $port445 = $false }
-
-    if (-not $port5985) {
-        [pscustomobject]@{
-            ComputerName = $computer
-            DnsResolved = $dnsResolved
-            ResolvedIp = $resolvedIp
-            Ping = $icmpOk
-            Port5985FromJumpbox = $port5985
-            Port445FromJumpbox = $port445
-            RemoteQuery = "Skipped: WinRM 5985 not reachable from Jumpbox"
-            LocalUserExists = $false
-            LocalUserEnabled = $false
-            LocalUserPasswordNeverExpires = $false
-            LocalUserMayChangePassword = ""
-            LocalUserIsAdministrator = $false
-            TargetAdminIsAdministrator = $false
-            WinRM = ""
-            LanmanServer = ""
-            LanmanWorkstation = ""
-            Netlogon = ""
-            WinRmHttp5985Listener = ""
-            LocalAccountTokenFilterPolicy = ""
-            AutoShareWks = ""
-            AdminShareExists = ""
-            FirewallWinRM5985 = ""
-            FirewallAdmtRpc135 = ""
-            FirewallAdmtSmb445 = ""
-            BootstrapLogFound = $false
-            BootstrapLogPath = ""
-            BootstrapLogLastWriteTime = ""
-            MatchingScheduledTasks = ""
-            OverallReady = $false
-            FailureSummary = "WinRM 5985 not reachable"
-        }
-        continue
-    }
-
+        $remoteResult = Invoke-Command -Session $session -ArgumentList $Label,$ComputerIp,$RunId,$MaxHashMB,$IncludeAllUserProfileMetadata -ScriptBlock {
+'@ -NewText @'
     try {
-        $invokeParams = @{
-            ComputerName = $computer
-            ScriptBlock = $remoteCheck
-            ArgumentList = @($localUserName,$targetAdminPrincipal,$policyLabel,$managementIps,$admtServerIps)
-            ErrorAction = "Stop"
-        }
+        Write-StatusLine -Message "Remote scan started for $Label. Expect live remote phase messages until the endpoint archive is ready."
+        $remoteResult = Invoke-Command -Session $session -ArgumentList $Label,$ComputerIp,$RunId,$MaxHashMB,$IncludeAllUserProfileMetadata -ScriptBlock {
+'@
 
-        if ($null -ne $credential) {
-            $invokeParams.Credential = $credential
-        }
+$text = Set-ExactPatch -Text $text -PatchName "Add identity scan phase status" -OldText @'
+            $computerSystem = Get-CimInstance Win32_ComputerSystem
+            $operatingSystem = Get-CimInstance Win32_OperatingSystem
+            $script:computerDomain = [string]$computerSystem.Domain
+'@ -NewText @'
+            Write-RemoteScanStatus -Message "Collecting identity, network, profile registry, and profile folder evidence"
+            $computerSystem = Get-CimInstance Win32_ComputerSystem
+            $operatingSystem = Get-CimInstance Win32_OperatingSystem
+            $script:computerDomain = [string]$computerSystem.Domain
+'@
 
-        $remoteResult = Invoke-Command @invokeParams
+$text = Set-ExactPatch -Text $text -PatchName "Fix inline if in profile registry rows" -OldText @'
+            $profileRegistryRows = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" -ErrorAction SilentlyContinue | ForEach-Object {
+                $profilePath = [string]$_.ProfileImagePath
+                [pscustomobject]@{
+'@ -NewText @'
+            $profileRegistryRows = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" -ErrorAction SilentlyContinue | ForEach-Object {
+                $profilePath = [string]$_.ProfileImagePath
+                $profileLeafName = ""
+                if (-not [string]::IsNullOrWhiteSpace($profilePath)) { $profileLeafName = Split-Path -Path $profilePath -Leaf }
+                [pscustomobject]@{
+'@
 
-        $checks = @()
-        if (-not $dnsResolved) { $checks += "DNS failed" }
-        if (-not $port5985) { $checks += "Port 5985 closed" }
-        if (-not $port445) { $checks += "Port 445 closed" }
-        if (-not $remoteResult.LocalUserExists) { $checks += "CM-MigrationAdmin missing" }
-        if (-not $remoteResult.LocalUserEnabled) { $checks += "CM-MigrationAdmin disabled" }
-        if (-not $remoteResult.LocalUserPasswordNeverExpires) { $checks += "PasswordNeverExpires not true" }
-        if ($remoteResult.LocalUserMayChangePassword -ne $false) { $checks += "UserMayChangePassword not false" }
-        if (-not $remoteResult.LocalUserIsAdministrator) { $checks += "CM-MigrationAdmin not local admin" }
-        if (-not $remoteResult.TargetAdminIsAdministrator) { $checks += "ID\Admin not local admin" }
-        if ($remoteResult.WinRM -notlike "Running/*") { $checks += "WinRM not running" }
-        if ($remoteResult.LanmanServer -notlike "Running/*") { $checks += "LanmanServer not running" }
-        if ($remoteResult.LanmanWorkstation -notlike "Running/*") { $checks += "LanmanWorkstation not running" }
-        if ($remoteResult.Netlogon -notlike "Running/*") { $checks += "Netlogon not running" }
-        if (-not $remoteResult.WinRmHttp5985Listener) { $checks += "WinRM HTTP 5985 listener missing" }
-        if ($remoteResult.LocalAccountTokenFilterPolicy -ne "1") { $checks += "LocalAccountTokenFilterPolicy not 1" }
-        if ($remoteResult.AutoShareWks -ne "1") { $checks += "AutoShareWks not 1" }
-        if (-not $remoteResult.AdminShareExists) { $checks += "Admin$ share missing" }
-        if ($remoteResult.FirewallWinRM5985 -like "Missing*") { $checks += "WinRM firewall rule missing" }
-        if ($remoteResult.FirewallAdmtRpc135 -like "Missing*") { $checks += "ADMT RPC firewall rule missing" }
-        if ($remoteResult.FirewallAdmtSmb445 -like "Missing*") { $checks += "ADMT SMB firewall rule missing" }
-        if (-not $remoteResult.BootstrapLogFound) { $checks += "Bootstrap log missing" }
+$text = Set-ExactPatch -Text $text -PatchName "Use precomputed profile leaf name" -OldText @'
+                    ProfileImagePath = $profilePath
+                    ProfileLeafName = if ([string]::IsNullOrWhiteSpace($profilePath)) { "" } else { Split-Path -Path $profilePath -Leaf }
+                    State = $_.State
+'@ -NewText @'
+                    ProfileImagePath = $profilePath
+                    ProfileLeafName = $profileLeafName
+                    State = $_.State
+'@
 
-        [pscustomobject]@{
-            ComputerName = $computer
-            DnsResolved = $dnsResolved
-            ResolvedIp = $resolvedIp
-            Ping = $icmpOk
-            Port5985FromJumpbox = $port5985
-            Port445FromJumpbox = $port445
-            RemoteQuery = $remoteResult.RemoteQuery
-            LocalUserExists = $remoteResult.LocalUserExists
-            LocalUserEnabled = $remoteResult.LocalUserEnabled
-            LocalUserPasswordNeverExpires = $remoteResult.LocalUserPasswordNeverExpires
-            LocalUserMayChangePassword = $remoteResult.LocalUserMayChangePassword
-            LocalUserIsAdministrator = $remoteResult.LocalUserIsAdministrator
-            TargetAdminIsAdministrator = $remoteResult.TargetAdminIsAdministrator
-            WinRM = $remoteResult.WinRM
-            LanmanServer = $remoteResult.LanmanServer
-            LanmanWorkstation = $remoteResult.LanmanWorkstation
-            Netlogon = $remoteResult.Netlogon
-            WinRmHttp5985Listener = $remoteResult.WinRmHttp5985Listener
-            LocalAccountTokenFilterPolicy = $remoteResult.LocalAccountTokenFilterPolicy
-            AutoShareWks = $remoteResult.AutoShareWks
-            AdminShareExists = $remoteResult.AdminShareExists
-            FirewallWinRM5985 = $remoteResult.FirewallWinRM5985
-            FirewallAdmtRpc135 = $remoteResult.FirewallAdmtRpc135
-            FirewallAdmtSmb445 = $remoteResult.FirewallAdmtSmb445
-            BootstrapLogFound = $remoteResult.BootstrapLogFound
-            BootstrapLogPath = $remoteResult.BootstrapLogPath
-            BootstrapLogLastWriteTime = $remoteResult.BootstrapLogLastWriteTime
-            MatchingScheduledTasks = $remoteResult.MatchingScheduledTasks
-            OverallReady = ($checks.Count -eq 0)
-            FailureSummary = ($checks -join "; ")
-        }
-    }
-    catch {
-        [pscustomobject]@{
-            ComputerName = $computer
-            DnsResolved = $dnsResolved
-            ResolvedIp = $resolvedIp
-            Ping = $icmpOk
-            Port5985FromJumpbox = $port5985
-            Port445FromJumpbox = $port445
-            RemoteQuery = "Failed: $($_.Exception.Message)"
-            LocalUserExists = ""
-            LocalUserEnabled = ""
-            LocalUserPasswordNeverExpires = ""
-            LocalUserMayChangePassword = ""
-            LocalUserIsAdministrator = ""
-            TargetAdminIsAdministrator = ""
-            WinRM = ""
-            LanmanServer = ""
-            LanmanWorkstation = ""
-            Netlogon = ""
-            WinRmHttp5985Listener = ""
-            LocalAccountTokenFilterPolicy = ""
-            AutoShareWks = ""
-            AdminShareExists = ""
-            FirewallWinRM5985 = ""
-            FirewallAdmtRpc135 = ""
-            FirewallAdmtSmb445 = ""
-            BootstrapLogFound = ""
-            BootstrapLogPath = ""
-            BootstrapLogLastWriteTime = ""
-            MatchingScheduledTasks = ""
-            OverallReady = $false
-            FailureSummary = "Remote query failed: $($_.Exception.Message)"
-        }
-    }
-}
+$text = Set-ExactPatch -Text $text -PatchName "Fix inline try in profile folder rows" -OldText @'
+            $profileFolderRows = @(Get-ChildDirectoriesSafe -RootPath "C:\Users" | ForEach-Object {
+                $desktopPath = Join-Path $_.FullName "Desktop"
+                $documentsPath = Join-Path $_.FullName "Documents"
+                $downloadsPath = Join-Path $_.FullName "Downloads"
+                $startMenuPath = Join-Path $_.FullName "AppData\Roaming\Microsoft\Windows\Start Menu"
+                [pscustomobject]@{
+'@ -NewText @'
+            $profileFolderRows = @(Get-ChildDirectoriesSafe -RootPath "C:\Users" | ForEach-Object {
+                $desktopPath = Join-Path $_.FullName "Desktop"
+                $documentsPath = Join-Path $_.FullName "Documents"
+                $downloadsPath = Join-Path $_.FullName "Downloads"
+                $startMenuPath = Join-Path $_.FullName "AppData\Roaming\Microsoft\Windows\Start Menu"
+                $folderOwner = "AclReadError"
+                try { $folderOwner = (Get-Acl -LiteralPath $_.FullName -ErrorAction Stop).Owner } catch { $folderOwner = "AclReadError" }
+                [pscustomobject]@{
+'@
 
-$results | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+$text = Set-ExactPatch -Text $text -PatchName "Use precomputed folder owner" -OldText @'
+                    LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+                    Owner = try { (Get-Acl -LiteralPath $_.FullName -ErrorAction Stop).Owner } catch { "AclReadError" }
+                }
+'@ -NewText @'
+                    LastWriteTimeUtc = $_.LastWriteTimeUtc.ToString("o")
+                    Owner = $folderOwner
+                }
+'@
 
-Write-Host ""
-Write-Host "Readiness report written to: $OutputPath" -ForegroundColor Green
-Write-Host ""
-$results | Group-Object OverallReady | Select-Object Name,Count | Format-Table -AutoSize
-Write-Host ""
-$results | Where-Object { $_.OverallReady -ne $true } | Select-Object ComputerName,ResolvedIp,Port5985FromJumpbox,Port445FromJumpbox,FailureSummary | Format-Table -AutoSize
-'@ | Set-Content -Path $scriptPath -Encoding UTF8; Write-Host "Created $scriptPath"
+$text = Set-ExactPatch -Text $text -PatchName "Add public and user folder progress" -OldText @'
+            foreach ($rootPath in $publicShortcutRoots) {
+                (Get-FilesFromRoot -RootPath $rootPath -Category "ShortcutSurface" -IncludeExtensions $shortcutExtensions -MaxHashMegabytes $EndpointMaxHashMB) | ForEach-Object { $shortcutRows.Add($_) }
+                (Get-FilesFromRoot -RootPath $rootPath -Category "VisibleSurface" -IncludeExtensions @() -MaxHashMegabytes $EndpointMaxHashMB) | ForEach-Object { $visibleFileRows.Add($_) }
+            }
+
+            $userFolders = @(Get-ChildDirectoriesSafe -RootPath "C:\Users" | Where-Object { $_.Name -notin @("All Users","Default User") })
+            foreach ($userFolder in $userFolders) {
+'@ -NewText @'
+            Write-RemoteScanStatus -Message "Scanning public Desktop and ProgramData Start Menu shortcut surfaces"
+            foreach ($rootPath in $publicShortcutRoots) {
+                Write-RemoteScanStatus -Message ("Scanning public surface: {0}" -f $rootPath)
+                (Get-FilesFromRoot -RootPath $rootPath -Category "ShortcutSurface" -IncludeExtensions $shortcutExtensions -MaxHashMegabytes $EndpointMaxHashMB) | ForEach-Object { $shortcutRows.Add($_) }
+                (Get-FilesFromRoot -RootPath $rootPath -Category "VisibleSurface" -IncludeExtensions @() -MaxHashMegabytes $EndpointMaxHashMB) | ForEach-Object { $visibleFileRows.Add($_) }
+            }
+
+            $userFolders = @(Get-ChildDirectoriesSafe -RootPath "C:\Users" | Where-Object { $_.Name -notin @("All Users","Default User") })
+            Write-RemoteScanStatus -Message ("Scanning user-visible profile surfaces under C:\Users. Profile folder count: {0}" -f @($userFolders).Count)
+            foreach ($userFolder in $userFolders) {
+                Write-RemoteScanStatus -Message ("Scanning user folder: {0}" -f $userFolder.FullName)
+'@
+
+$text = Set-ExactPatch -Text $text -PatchName "Add quarantine progress and CSV export progress" -OldText @'
+            $quarantineRoot = "C:\ADMS-ProfileQuarantine\Wave-002-PostJoin-DuplicateProfiles\PPRESORT1AWS"
+            if (Test-Path -LiteralPath $quarantineRoot) {
+                (Get-FilesFromRoot -RootPath $quarantineRoot -Category "QuarantineSurface" -IncludeExtensions @() -MaxHashMegabytes $EndpointMaxHashMB) | ForEach-Object { $quarantineRows.Add($_) }
+            }
+
+            $identityRows | Export-Csv -Path (Join-Path $remoteRoot "identity.csv") -NoTypeInformation -Encoding UTF8
+'@ -NewText @'
+            $quarantineRoot = "C:\ADMS-ProfileQuarantine\Wave-002-PostJoin-DuplicateProfiles\PPRESORT1AWS"
+            Write-RemoteScanStatus -Message "Scanning ADMS duplicate-profile quarantine folder if present"
+            if (Test-Path -LiteralPath $quarantineRoot) {
+                Write-RemoteScanStatus -Message "Quarantine folder found; scanning preserved duplicate-profile evidence"
+                (Get-FilesFromRoot -RootPath $quarantineRoot -Category "QuarantineSurface" -IncludeExtensions @() -MaxHashMegabytes $EndpointMaxHashMB) | ForEach-Object { $quarantineRows.Add($_) }
+            }
+            else {
+                Write-RemoteScanStatus -Message "Quarantine folder not present on this endpoint"
+            }
+
+            Write-RemoteScanStatus -Message "Writing remote CSV evidence files"
+            $identityRows | Export-Csv -Path (Join-Path $remoteRoot "identity.csv") -NoTypeInformation -Encoding UTF8
+'@
+
+$text = Set-ExactPatch -Text $text -PatchName "Add archive progress" -OldText @'
+            Compress-Archive -Path (Join-Path $remoteRoot "*") -DestinationPath $archivePath -Force
+            return [pscustomobject]@{
+'@ -NewText @'
+            Write-RemoteScanStatus -Message "Compressing remote evidence archive"
+            Compress-Archive -Path (Join-Path $remoteRoot "*") -DestinationPath $archivePath -Force
+            Write-RemoteScanStatus -Message "Remote endpoint scan complete"
+            return [pscustomobject]@{
+'@
+
+$parseTokens = $null
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseInput($text,[ref]$parseTokens,[ref]$parseErrors) | Out-Null
+if ($parseErrors -and $parseErrors.Count -gt 0) { $parseErrors | Format-List; throw "Patched script failed syntax validation; original file was not overwritten." }
+
+Set-Content -Path $scriptPath -Value ($text -replace "`n","`r`n") -Encoding UTF8
+Write-Host "Patch complete and syntax validated: $scriptPath" -ForegroundColor Green
